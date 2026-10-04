@@ -16,6 +16,7 @@ NoteAlong turns lectures, YouTube videos and recordings into study notes with fl
 - Write your own thoughts under **My notes** at the end of each file. Sync never touches that section.
 - Properties and tags you add are kept. Spaced Repetition review data (`<!--SR:…-->`) is kept.
 - If you edit the part NoteAlong wrote and the note then changes in NoteAlong, your file is left alone and the update is written next to it as `Title (NoteAlong update).md`.
+- A sync only writes a file when something in it actually changes, so tools that sync your vault between devices see no needless edits.
 - Rename or move a file in your vault and sync follows it. Delete it and it stays deleted (use **Restore notes deleted from the vault** to bring them back).
 - A note deleted in NoteAlong keeps its file, marked `notealong_deleted: <date>`. You can choose to move such files to the trash instead.
 

@@ -11,9 +11,15 @@
  * - keeps Spaced Repetition review comments (`<!--SR:…-->`) on cards whose
  *   front still exists, so the SR plugin's schedule survives,
  * - and never clobbers a managed part the user edited: the file records
- *   `notealong_hash` (hash of the managed body as last written); if the
+ *   `notealong_hash` (hash of the managed body NoteAlong last wrote); if the
  *   current body no longer matches, the update goes to a sibling
  *   "<name> (NoteAlong update).md" instead.
+ *
+ * "New from NoteAlong" is decided against that same hash: when the incoming
+ * body is the one NoteAlong last wrote (the change feed re-sends notes it has
+ * already sent), the body on disk is left exactly as it is, edited or not.
+ * Only the owned properties can still change then (a rename or folder move in
+ * NoteAlong); when they match too, the file is not touched at all.
  */
 
 export const MY_NOTES_HEADING = "## My notes";
@@ -145,15 +151,31 @@ export function hashText(text: string): string {
 /**
  * Hash of a managed body as the user sees it: SR comments (written by the
  * SR plugin, not by the user) and trailing whitespace don't count as edits.
+ * A comment on a line of its own (multi-line cards) goes with its line.
  */
 export function managedHash(managed: string): string {
-  const canonical = normalizeNewlines(managed)
+  return hashText(
+    canonicalManaged(
+      normalizeNewlines(managed).replace(/(^|\n)[ \t]*<!--SR:[^>]*-->[ \t]*(?=\n|$)/g, ""),
+    ),
+  );
+}
+
+/**
+ * The hash 0.1.0 recorded: an SR comment on its own line left an empty line
+ * behind. Accepted when reading `notealong_hash`, never written.
+ */
+function legacyManagedHash(managed: string): string {
+  return hashText(canonicalManaged(normalizeNewlines(managed)));
+}
+
+function canonicalManaged(managed: string): string {
+  return managed
     .replace(/[ \t]*<!--SR:[^>]*-->/g, "")
     .split("\n")
     .map((line) => line.replace(/\s+$/, ""))
     .join("\n")
     .trim();
-  return hashText(canonical);
 }
 
 /** card front → its SR comment, from a managed body. */
@@ -210,16 +232,33 @@ export interface MergeResult {
   /** Final file text to write at the target path. */
   text: string;
   /**
-   * The user edited the managed part since our last write: `text` is the
-   * fresh render (+ their My notes) and must go to a sibling conflict file;
-   * the existing file stays untouched.
+   * The user edited the managed part since our last write and NoteAlong has
+   * a new body: `text` is the fresh render (+ their My notes) and must go to
+   * a sibling conflict file; the existing file stays untouched.
    */
   conflict: boolean;
+  /**
+   * Nothing new from NoteAlong for this file: `text` is `existing`, byte for
+   * byte, and must not be written (a move to a new path may still be due).
+   */
+  unchanged: boolean;
+  /** The `notealong_hash` of `text`: the body NoteAlong last wrote. */
+  hash: string;
 }
 
 /**
  * Merge a freshly rendered file (`incoming`, from the change feed) with what
  * is on disk (`existing`, or null for a new file).
+ *
+ * - Incoming body = the one NoteAlong last wrote (`notealong_hash`): the body
+ *   on disk stays exactly as it is (edits and SR comments included) and only
+ *   owned properties are refreshed; `unchanged` when that changes nothing.
+ * - New incoming body, managed part unedited: rewritten in place.
+ * - New incoming body, managed part edited: `conflict`.
+ * - No `notealong_hash` on disk (a zip / "Open in Obsidian" export, or the
+ *   property was removed): nothing tells a user edit from a NoteAlong change,
+ *   so it counts as unedited, as those exports do (My notes, the user's
+ *   properties and SR comments still survive).
  */
 export function mergeNote(
   incoming: string,
@@ -228,15 +267,35 @@ export function mergeNote(
 ): MergeResult {
   const fresh = parseNote(incoming);
   const old = existing === null ? null : parseNote(existing);
+  const freshManaged = fresh.managed.replace(/\s+$/, "");
+  const freshHash = managedHash(freshManaged);
+  const srComments = old ? collectSrComments(old.managed) : new Map<string, string>();
 
-  // Managed body: fresh render, SR comments carried over by card front.
-  let managed = fresh.managed.replace(/\s+$/, "");
-  let conflict = false;
-  if (old) {
-    const recorded = frontmatterValue(old.frontmatter, "notealong_hash");
-    if (recorded && recorded !== managedHash(old.managed)) conflict = true;
-    managed = applySrComments(managed, collectSrComments(old.managed));
+  const recorded = old ? frontmatterValue(old.frontmatter, "notealong_hash") : null;
+  // The incoming body is the one NoteAlong last wrote here (0.1.0 hashed it
+  // with the SR comments re-attached, the legacy way).
+  const sameBody =
+    recorded !== null &&
+    (recorded === freshHash ||
+      recorded === legacyManagedHash(applySrComments(freshManaged, srComments)));
+  const edited =
+    old !== null &&
+    recorded !== null &&
+    recorded !== managedHash(old.managed) &&
+    recorded !== legacyManagedHash(old.managed);
+
+  let managed: string;
+  let hash: string;
+  if (old && recorded !== null && sameBody) {
+    // Nothing new in the body: what is on disk stays, edits included.
+    managed = old.managed.replace(/\s+$/, "");
+    hash = recorded;
+  } else {
+    // Fresh render, SR comments carried over by card front.
+    managed = applySrComments(freshManaged, srComments);
+    hash = freshHash;
   }
+  const conflict = edited && !sameBody;
 
   // User part: theirs when present, else the fresh "My notes" stub.
   const user =
@@ -266,17 +325,70 @@ export function mergeNote(
         }
       : entry,
   );
+
+  if (existing !== null && sameBody && sameOwned(merged, old?.frontmatter ?? [])) {
+    return { text: existing, conflict: false, unchanged: true, hash };
+  }
+
   merged.push(
     {
       key: "notealong_synced",
       lines: [`notealong_synced: ${options.syncedAt.toISOString().slice(0, 19)}`],
     },
-    { key: "notealong_hash", lines: [`notealong_hash: ${managedHash(managed)}`] },
+    { key: "notealong_hash", lines: [`notealong_hash: ${hash}`] },
     ...theirs,
   );
 
   const text = `${renderFrontmatter(merged)}\n\n${managed.replace(/^\s+/, "")}\n\n${user}`;
-  return { text, conflict };
+  return { text, conflict, unchanged: false, hash };
+}
+
+/**
+ * The owned properties of a merge equal the ones on disk by value (quoting
+ * and list style that the Properties editor may re-serialize don't count;
+ * bookkeeping keys are ignored). `notealong_deleted` on disk is a difference:
+ * the note is back.
+ */
+function sameOwned(ours: FrontmatterEntry[], onDisk: FrontmatterEntry[]): boolean {
+  const values = (entries: FrontmatterEntry[]) => {
+    const out = new Map<string, string>();
+    for (const entry of entries) {
+      if (!OWNED_KEYS.has(entry.key) || out.has(entry.key)) continue;
+      if (entry.key === "notealong_hash" || entry.key === "notealong_synced") continue;
+      out.set(entry.key, entryValue(entry));
+    }
+    return out;
+  };
+  const a = values(ours);
+  const b = values(onDisk);
+  if (a.size !== b.size) return false;
+  for (const [key, value] of a) {
+    if (b.get(key) !== value) return false;
+  }
+  return true;
+}
+
+function entryValue(entry: FrontmatterEntry): string {
+  const inline = entry.lines[0].slice(entry.lines[0].indexOf(":") + 1).trim();
+  if (entry.lines.length > 1 || inline.startsWith("[")) {
+    return `[${listItems(entry).join("\u0000")}]`;
+  }
+  return inline.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");
+}
+
+/**
+ * Two versions of a file say the same, apart from our bookkeeping keys
+ * (`notealong_synced`, `notealong_hash`), line endings and trailing space:
+ * writing one over the other would only churn the file.
+ */
+export function sameContent(a: string, b: string): boolean {
+  return contentSignature(a) === contentSignature(b);
+}
+
+function contentSignature(text: string): string {
+  return normalizeNewlines(text)
+    .replace(/^notealong_(synced|hash):.*\n?/gm, "")
+    .replace(/\s+$/, "");
 }
 
 /**
@@ -301,6 +413,14 @@ export function markDeleted(existing: string, deletedAt: Date): string {
 /** "Lecture.md" → "Lecture (NoteAlong update).md". */
 export function conflictPath(path: string): string {
   return path.replace(/(\.md)?$/i, " (NoteAlong update).md");
+}
+
+/**
+ * A conflict copy: it carries the note's `notealong_id` too, so scans for a
+ * note's file skip it (the user's file is the note's file, wherever it is).
+ */
+export function isConflictCopy(path: string): boolean {
+  return / \(NoteAlong update\)\.md$/i.test(path);
 }
 
 /** Identity of a synced file: note id + language version ("" = original). */

@@ -12,9 +12,14 @@
  *   notes");
  * - a note deleted in NoteAlong keeps its file, marked `notealong_deleted`
  *   (or goes to the trash when the user chose that);
- * - the managed part is never clobbered after a user edit: the update goes
- *   to "<name> (NoteAlong update).md";
- * - a file that only differs in our bookkeeping keys is not rewritten.
+ * - the managed part is never clobbered after a user edit: a NEW body from
+ *   NoteAlong goes to "<name> (NoteAlong update).md" (rewritten only when
+ *   it says something new); a re-sent body NoteAlong already wrote leaves
+ *   the file alone;
+ * - a file whose text would not change (bookkeeping keys aside) is never
+ *   rewritten, so vault sync services see no churn; a rename without new
+ *   content is only a rename;
+ * - conflict copies are never taken for the note's own file;
  * - a note is never moved onto a path that holds somebody else's file (it
  *   gets "<name> (2).md"; the web has the same rule).
  */
@@ -24,12 +29,11 @@ import type { VaultIO } from "./io";
 import {
 	conflictPath,
 	fileKey,
-	hashText,
 	identityOf,
-	managedHash,
+	isConflictCopy,
 	markDeleted,
 	mergeNote,
-	parseNote,
+	sameContent,
 } from "./merge";
 import { ATTACHMENTS_DIR, attachmentPath, isInside, normalizeRoot, parentOf, vaultPath } from "./paths";
 
@@ -92,16 +96,6 @@ export function optionsKey(feed: FeedOptions): string {
 	return `v${feed.versions ? 1 : 0}t${feed.transcript ? 1 : 0}f${feed.flashcards ? 1 : 0}`;
 }
 
-/** Same as the web engine: ignore our own bookkeeping keys and trailing space. */
-export function signature(text: string): string {
-	return hashText(
-		text
-			.replace(/\r\n?/g, "\n")
-			.replace(/^notealong_(synced|hash):.*\n?/gm, "")
-			.replace(/\s+$/, ""),
-	);
-}
-
 async function freePath(path: string, taken: (p: string) => Promise<boolean>): Promise<string> {
 	const stem = path.replace(/\.md$/i, "");
 	for (let n = 2; n < 100; n++) {
@@ -162,6 +156,7 @@ export class SyncEngine {
 			if (!scan) {
 				scan = new Map();
 				for (const path of await io.listMarkdown(root, [ATTACHMENTS_DIR])) {
+					if (isConflictCopy(path)) continue;
 					const text = await io.read(path);
 					const id = text === null ? null : identityOf(text.slice(0, 4096));
 					if (id && !scan.has(id)) scan.set(id, path);
@@ -245,26 +240,35 @@ export class SyncEngine {
 						const merged = mergeNote(file.markdown, existing, { syncedAt: now });
 
 						if (merged.conflict && existingPath) {
-							await io.write(conflictPath(existingPath), merged.text);
-							result.conflicts += 1;
-						} else {
-							const freshHash = managedHash(parseNote(merged.text).managed);
-							const unchanged =
-								existing !== null && existingPath === target && signature(existing) === signature(merged.text);
-							if (unchanged) {
+							// A new body from NoteAlong over a user edit: offer it next to
+							// their file (once: an identical copy is left alone).
+							const copyPath = conflictPath(existingPath);
+							const copy = await io.read(copyPath);
+							if (copy !== null && sameContent(copy, merged.text)) {
 								result.unchanged += 1;
 							} else {
-								if (existingPath && existingPath !== target) {
-									await io.rename(existingPath, target);
-									await tidy(existingPath);
-									result.moved += 1;
-								}
+								await io.write(copyPath, merged.text);
+								result.conflicts += 1;
+							}
+						} else {
+							const moving = existingPath !== null && existingPath !== target;
+							if (existingPath && moving) {
+								await io.rename(existingPath, target);
+								await tidy(existingPath);
+								result.moved += 1;
+							}
+							// Identical apart from our own bookkeeping keys: leave the file
+							// (and its modified time) alone.
+							const same = existing !== null && (merged.unchanged || sameContent(existing, merged.text));
+							if (!same) {
 								await io.write(target, merged.text);
 								if (existing === null) result.written += 1;
 								else result.updated += 1;
+							} else if (!moving) {
+								result.unchanged += 1;
 							}
 							state.files[key] = target;
-							state.hashes[key] = freshHash;
+							state.hashes[key] = merged.hash;
 						}
 
 						for (const attachment of file.attachments) {

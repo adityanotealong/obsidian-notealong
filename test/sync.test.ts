@@ -297,3 +297,142 @@ describe("feed paging and errors", () => {
 		expect(server.calls.filter((c) => c.url.includes("/v1/export/whoami"))).toHaveLength(1);
 	});
 });
+
+describe("re-sent notes and conflicts", () => {
+	const path = "NoteAlong/Loose.md";
+
+	async function editManaged(): Promise<string> {
+		const mine = (await vault.read(path))!.replace("Root note.", "Root note, rewritten by me.");
+		await vault.write(path, mine);
+		return mine;
+	}
+
+	test("an unchanged re-send after a managed edit: no copy, no write", async () => {
+		await sync();
+		const mine = await editManaged();
+		const writes = vault.writes;
+		// The feed re-sends the same note (the ~5 min overlap).
+		server.put("n2", "Loose", [
+			file("n2", "Loose", path, "Root note."),
+			file("n2", "Loose", "NoteAlong/Loose (es).md", "Nota.", { version: "es" }),
+		]);
+		const result = await sync();
+		expect(result).toMatchObject({ conflicts: 0, updated: 0, written: 0, unchanged: 2 });
+		expect(vault.writes).toBe(writes);
+		expect(await vault.exists(conflictPath(path))).toBe(false);
+		expect(await vault.read(path)).toBe(mine);
+		expect(describeResult(result)).toBe("up to date");
+	});
+
+	test("regression: edit → unchanged re-send → no copy; then a real change → exactly one copy, written once", async () => {
+		await sync();
+		const mine = await editManaged();
+		server.put("n2", "Loose", [file("n2", "Loose", path, "Root note.")]);
+		expect((await sync()).conflicts).toBe(0);
+		expect(await vault.exists(conflictPath(path))).toBe(false);
+
+		server.put("n2", "Loose", [file("n2", "Loose", path, "Root note v2.")]);
+		const changed = await sync();
+		expect(changed.conflicts).toBe(1);
+		expect(await vault.read(path)).toBe(mine);
+		const copy = (await vault.read(conflictPath(path)))!;
+		expect(copy).toContain("Root note v2.");
+		const copies = Object.keys(await vault.snapshot()).filter((f) => f.includes("(NoteAlong update)"));
+		expect(copies).toEqual([conflictPath(path)]);
+
+		// The same new body re-sent: the identical copy is not rewritten or recounted.
+		const writes = vault.writes;
+		server.put("n2", "Loose", [file("n2", "Loose", path, "Root note v2.")]);
+		const again = await sync();
+		expect(again.conflicts).toBe(0);
+		expect(vault.writes).toBe(writes);
+		expect(await vault.read(conflictPath(path))).toBe(copy);
+		expect(await vault.read(path)).toBe(mine);
+
+		// Yet another new body: the copy is refreshed (one write), the file still untouched.
+		server.put("n2", "Loose", [file("n2", "Loose", path, "Root note v3.")]);
+		const third = await sync();
+		expect(third.conflicts).toBe(1);
+		expect(vault.written.slice(writes)).toEqual([conflictPath(path)]);
+		expect(await vault.read(conflictPath(path))).toContain("Root note v3.");
+		expect(await vault.read(path)).toBe(mine);
+	});
+
+	test("an unedited file is updated in place on a real change, without a copy", async () => {
+		await sync();
+		server.put("n2", "Loose", [file("n2", "Loose", path, "Root note v2.")]);
+		const writes = vault.writes;
+		const result = await sync();
+		expect(result).toMatchObject({ updated: 1, conflicts: 0 });
+		expect(vault.written.slice(writes)).toEqual([path]);
+		expect(await vault.read(path)).toContain("Root note v2.");
+		expect(await vault.exists(conflictPath(path))).toBe(false);
+	});
+
+	test("a NoteAlong folder move over an edited file moves it, keeps the edit, writes nothing else", async () => {
+		await sync();
+		await editManaged();
+		const writes = vault.writes;
+		server.put("n2", "Loose", [file("n2", "Loose", "NoteAlong/Archive/Loose.md", "Root note.")]);
+		const result = await sync();
+		expect(result).toMatchObject({ moved: 1, conflicts: 0, updated: 0 });
+		expect(vault.renames).toEqual([[path, "NoteAlong/Archive/Loose.md"]]);
+		expect(vault.writes).toBe(writes);
+		expect(await vault.read("NoteAlong/Archive/Loose.md")).toContain("Root note, rewritten by me.");
+		expect(state.files["n2:"]).toBe("NoteAlong/Archive/Loose.md");
+	});
+
+	test("an owned-property change over an edited file is applied in place; the edit stays", async () => {
+		await sync();
+		await editManaged();
+		server.put("n2", "Loose", [
+			{ ...file("n2", "Loose", path, "Root note."), markdown: file("n2", "Loose", path, "Root note.").markdown.replace("title: Loose", "title: Loose\nfolder: Inbox") },
+		]);
+		const result = await sync();
+		expect(result).toMatchObject({ updated: 1, conflicts: 0 });
+		const text = (await vault.read(path))!;
+		expect(text).toContain("folder: Inbox");
+		expect(text).toContain("Root note, rewritten by me.");
+		expect(await vault.exists(conflictPath(path))).toBe(false);
+	});
+
+	test("files from 0.1.0 (no change) are adopted without a single write", async () => {
+		// What 0.1.0 wrote for this render: same merge, recorded hash and all.
+		await sync();
+		const before = await vault.snapshot();
+		state = emptyState(); // a fresh install over the same vault
+		const writes = vault.writes;
+		for (const id of ["n1", "n2"]) server.put(id, server.notes.get(id)!.title, server.notes.get(id)!.files);
+		const result = await sync();
+		expect(result).toMatchObject({ written: 0, updated: 0, conflicts: 0 });
+		expect(vault.writes).toBe(writes);
+		expect(await vault.snapshot()).toEqual(before);
+	});
+
+	test("a conflict copy is never taken for the note's own file", async () => {
+		await sync();
+		await editManaged();
+		server.put("n2", "Loose", [file("n2", "Loose", path, "Root note v2.")]);
+		await sync();
+		// The user files their note elsewhere; a new install scans for it.
+		await vault.rename(path, "NoteAlong/Zz/Loose.md");
+		state = emptyState();
+		const copy = await vault.read(conflictPath(path));
+		await sync();
+		// The user's file is still the note's file (its new body is offered
+		// next to it); the old copy was not adopted, moved or rewritten.
+		expect(await vault.read("NoteAlong/Zz/Loose.md")).toContain("Root note, rewritten by me.");
+		expect(await vault.read(conflictPath("NoteAlong/Zz/Loose.md"))).toContain("Root note v2.");
+		expect(await vault.read(conflictPath(path))).toBe(copy);
+		expect(await vault.exists(path)).toBe(false);
+	});
+
+	test("attachments already present are never fetched or written again", async () => {
+		await sync();
+		const binaries = vault.binaryWrites;
+		server.put("n1", "Cells", [file("n1", "Cells", "NoteAlong/Biology/Cells.md", "Cells are tiny.", { attachments: ["na-0123456789.png"] })]);
+		await sync();
+		expect(vault.binaryWrites).toBe(binaries);
+		expect(server.attachmentCalls).toBe(1);
+	});
+});

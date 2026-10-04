@@ -11,6 +11,9 @@ export class FsVault implements VaultIO {
 	readonly trashed: string[] = [];
 	readonly renames: [string, string][] = [];
 	writes = 0;
+	/** Every text write, in order (path). */
+	readonly written: string[] = [];
+	binaryWrites = 0;
 
 	constructor(readonly root: string) {}
 
@@ -38,11 +41,13 @@ export class FsVault implements VaultIO {
 		await mkdir(dirname(this.abs(path)), { recursive: true });
 		await writeFile(this.abs(path), text, "utf8");
 		this.writes += 1;
+		this.written.push(path);
 	}
 
 	async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
 		await mkdir(dirname(this.abs(path)), { recursive: true });
 		await writeFile(this.abs(path), Buffer.from(data));
+		this.binaryWrites += 1;
 	}
 
 	async rename(from: string, to: string): Promise<void> {
