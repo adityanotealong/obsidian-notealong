@@ -1,0 +1,8 @@
+node_modules/
+# The built main.js is a release artifact: committed only in release tags'
+# assets, never in the source tree. Run `npm run build` to produce it.
+main.js
+*.map
+data.json
+.DS_Store
+test/.tmp/

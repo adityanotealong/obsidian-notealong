@@ -1,0 +1,4 @@
+/* NoteAlong: the status bar item only. */
+.notealong-status {
+	white-space: nowrap;
+}

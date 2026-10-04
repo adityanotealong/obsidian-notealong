@@ -1,0 +1,10 @@
+{
+  "id": "notealong",
+  "name": "NoteAlong",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Sync your NoteAlong lecture notes, flashcards and transcripts into your vault, edit-safe.",
+  "author": "NoteAlong",
+  "authorUrl": "https://notealong.com",
+  "isDesktopOnly": false
+}
